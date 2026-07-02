@@ -16,14 +16,14 @@ Django-style database migrations for Go projects using [GORM](https://gorm.io) m
 ## Install
 
 ```bash
-go get github.com/boomdevs/go_migrations@v0.1.0
+go get github.com/Redwanthedeveloper/go-migrations@v0.1.0
 ```
 
 Or use the CLI tools:
 
 ```bash
-go install github.com/boomdevs/go_migrations/cmd/makemigrations@latest
-go install github.com/boomdevs/go_migrations/cmd/migrate@latest
+go install github.com/Redwanthedeveloper/go-migrations/cmd/makemigrations@latest
+go install github.com/Redwanthedeveloper/go-migrations/cmd/migrate@latest
 ```
 
 ## Quick start
@@ -67,7 +67,7 @@ migrate -dir migrations -database-url "$DATABASE_URL"
 ## Library usage
 
 ```go
-import "github.com/boomdevs/go_migrations"
+import "github.com/Redwanthedeveloper/go-migrations"
 
 result, err := go_migrations.Generate(ctx, go_migrations.Options{
     ModelsRoot:    ".",
@@ -93,15 +93,15 @@ err = go_migrations.Apply(ctx, go_migrations.MigrateOptions{
 
 ## Publishing
 
-This module is published at:
+Published at [github.com/Redwanthedeveloper/go-migrations](https://github.com/Redwanthedeveloper/go-migrations).
 
-**Module path:** `github.com/boomdevs/go_migrations`
+**Module path:** `github.com/Redwanthedeveloper/go-migrations`
 
-To publish a new version:
+To release a new version:
 
 ```bash
-git tag v0.1.0
-git push origin v0.1.0
+git tag v0.1.1
+git push origin v0.1.1
 ```
 
 Go module proxy will index the tag automatically.

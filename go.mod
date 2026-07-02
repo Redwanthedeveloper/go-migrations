@@ -1,4 +1,4 @@
-module github.com/boomdevs/go_migrations
+module github.com/Redwanthedeveloper/go-migrations
 
 go 1.26
 

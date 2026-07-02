@@ -1,4 +1,4 @@
-module github.com/boomdevs/go_migrations/testdata/fixtures
+module github.com/Redwanthedeveloper/go-migrations/testdata/fixtures
 
 go 1.22
 

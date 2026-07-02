@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/boomdevs/go_migrations"
+	"github.com/Redwanthedeveloper/go-migrations"
 	"github.com/google/uuid"
 	"gorm.io/datatypes"
 )

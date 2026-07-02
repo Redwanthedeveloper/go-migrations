@@ -314,9 +314,8 @@ func normalizeDefault(value string) string {
 func introspectExcludedTables(extra ...string) []string {
 	seen := map[string]struct{}{
 		DefaultMigrationsTable: {},
-		"schema_migrations":      {},
-		"django_migrations":      {},
-		"zivo_migrations":        {},
+		"schema_migrations":    {},
+		"django_migrations":    {},
 	}
 	for _, name := range extra {
 		if name != "" {

@@ -8,7 +8,7 @@ import (
 	"os"
 	"os/signal"
 
-	"github.com/boomdevs/go_migrations"
+	"github.com/Redwanthedeveloper/go-migrations"
 )
 
 func main() {

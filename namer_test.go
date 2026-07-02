@@ -3,7 +3,7 @@ package go_migrations_test
 import (
 	"testing"
 
-	"github.com/boomdevs/go_migrations"
+	"github.com/Redwanthedeveloper/go-migrations"
 )
 
 func TestMigrationNameInitial(t *testing.T) {
