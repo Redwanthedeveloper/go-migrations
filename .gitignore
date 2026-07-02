@@ -1,0 +1,10 @@
+# Binaries
+/bin/
+/dist/
+
+# Test
+*.test
+coverage.out
+
+# Go
+vendor/
