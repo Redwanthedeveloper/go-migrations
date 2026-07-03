@@ -3,31 +3,127 @@ package go_migrations
 import (
 	"context"
 	"database/sql"
-	"errors"
 	"fmt"
-	"os"
+	"strconv"
+	"strings"
 	"time"
 
 	_ "github.com/lib/pq"
 )
 
-// DefaultMigrationsTable is the applied-migrations tracking table when none is set.
-const DefaultMigrationsTable = "go_migrations"
+// DefaultMigrationsTable tracks the currently-applied revision, Alembic-style:
+// it holds at most one row (version_num) pointing at the current head.
+const DefaultMigrationsTable = "go_migrations_version"
 
 // MigrateOptions configure database migration execution.
 type MigrateOptions struct {
 	DatabaseURL     string
 	MigrationsDir   string
 	MigrationsTable string
-	Direction       string // up or down
-	Steps           int    // 0 = all pending (up) or one step (down default in CLI)
+
+	// Logf, when set, receives human-readable progress lines.
+	Logf func(format string, args ...any)
 }
 
-// Apply runs pending migrations and records them in the migrations table (Django-style).
-func Apply(ctx context.Context, opts MigrateOptions) error {
-	if opts.DatabaseURL == "" {
-		return fmt.Errorf("database URL is required")
+func (o MigrateOptions) logf(format string, args ...any) {
+	if o.Logf != nil {
+		o.Logf(format, args...)
 	}
+}
+
+// Upgrade runs revisions forward until target is reached.
+// target may be "head", a relative step ("+2"), or a revision id (or prefix).
+func Upgrade(ctx context.Context, opts MigrateOptions, target string) error {
+	return run(ctx, opts, func(ctx context.Context, db *sql.DB, table string, ordered []Revision, currentIdx int) error {
+		targetIdx, err := resolveUpgradeTarget(ordered, currentIdx, target)
+		if err != nil {
+			return err
+		}
+		if targetIdx <= currentIdx {
+			opts.logf("Already at or ahead of target %q; nothing to upgrade.", target)
+			return nil
+		}
+		for i := currentIdx + 1; i <= targetIdx; i++ {
+			rev := ordered[i]
+			if err := runRevision(ctx, db, table, rev.UpSQL, rev.ID); err != nil {
+				return fmt.Errorf("upgrade %s: %w", rev.ID, err)
+			}
+			opts.logf("Running upgrade %s -> %s, %s", displayDown(rev.DownRevision), rev.ID, rev.Message)
+		}
+		return nil
+	})
+}
+
+// Downgrade rolls revisions back until target is reached.
+// target may be "base", a relative step ("-1"), or a revision id (or prefix).
+func Downgrade(ctx context.Context, opts MigrateOptions, target string) error {
+	return run(ctx, opts, func(ctx context.Context, db *sql.DB, table string, ordered []Revision, currentIdx int) error {
+		targetIdx, err := resolveDowngradeTarget(ordered, currentIdx, target)
+		if err != nil {
+			return err
+		}
+		if targetIdx >= currentIdx {
+			opts.logf("Already at or below target %q; nothing to downgrade.", target)
+			return nil
+		}
+		for i := currentIdx; i > targetIdx; i-- {
+			rev := ordered[i]
+			if err := runRevision(ctx, db, table, rev.DownSQL, rev.DownRevision); err != nil {
+				return fmt.Errorf("downgrade %s: %w", rev.ID, err)
+			}
+			opts.logf("Running downgrade %s -> %s, %s", rev.ID, displayDown(rev.DownRevision), rev.Message)
+		}
+		return nil
+	})
+}
+
+// Stamp sets the recorded revision to target without running any SQL.
+func Stamp(ctx context.Context, opts MigrateOptions, target string) error {
+	return run(ctx, opts, func(ctx context.Context, db *sql.DB, table string, ordered []Revision, currentIdx int) error {
+		var revID string
+		switch target {
+		case "base":
+			revID = ""
+		case "head":
+			if len(ordered) == 0 {
+				return fmt.Errorf("no revisions to stamp")
+			}
+			revID = ordered[len(ordered)-1].ID
+		default:
+			idx, err := indexByID(ordered, target)
+			if err != nil {
+				return err
+			}
+			revID = ordered[idx].ID
+		}
+		if err := setCurrentRevision(ctx, db, table, revID); err != nil {
+			return err
+		}
+		opts.logf("Stamped revision to %s", displayDown(revID))
+		return nil
+	})
+}
+
+// CurrentRevision returns the currently-applied revision id ("" when none).
+func CurrentRevision(ctx context.Context, opts MigrateOptions) (string, error) {
+	table, err := normalizeMigrationsTable(opts.MigrationsTable)
+	if err != nil {
+		return "", err
+	}
+	db, err := openDatabase(ctx, opts.DatabaseURL)
+	if err != nil {
+		return "", err
+	}
+	defer db.Close()
+	if err := ensureVersionTable(ctx, db, table); err != nil {
+		return "", err
+	}
+	return currentRevision(ctx, db, table)
+}
+
+// run wires up shared setup (db, table, ordered graph, current position) for the
+// mutating commands.
+func run(ctx context.Context, opts MigrateOptions, fn func(context.Context, *sql.DB, string, []Revision, int) error) error {
 	if opts.MigrationsDir == "" {
 		opts.MigrationsDir = "migrations"
 	}
@@ -35,44 +131,50 @@ func Apply(ctx context.Context, opts MigrateOptions) error {
 	if err != nil {
 		return err
 	}
-
-	db, err := sql.Open("postgres", opts.DatabaseURL)
+	ordered, err := OrderedRevisions(opts.MigrationsDir)
 	if err != nil {
-		return fmt.Errorf("open database: %w", err)
+		return err
+	}
+
+	db, err := openDatabase(ctx, opts.DatabaseURL)
+	if err != nil {
+		return err
 	}
 	defer db.Close()
 
+	if err := ensureVersionTable(ctx, db, table); err != nil {
+		return err
+	}
+	current, err := currentRevision(ctx, db, table)
+	if err != nil {
+		return err
+	}
+	currentIdx := -1
+	if current != "" {
+		idx, err := indexByID(ordered, current)
+		if err != nil {
+			return fmt.Errorf("recorded revision %q not found on disk: %w", current, err)
+		}
+		currentIdx = idx
+	}
+	return fn(ctx, db, table, ordered, currentIdx)
+}
+
+func openDatabase(ctx context.Context, databaseURL string) (*sql.DB, error) {
+	if databaseURL == "" {
+		return nil, fmt.Errorf("database URL is required")
+	}
+	db, err := sql.Open("postgres", databaseURL)
+	if err != nil {
+		return nil, fmt.Errorf("open database: %w", err)
+	}
 	pingCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	if err := db.PingContext(pingCtx); err != nil {
-		return fmt.Errorf("ping database: %w", err)
+		db.Close()
+		return nil, fmt.Errorf("ping database: %w", err)
 	}
-
-	if err := ensureMigrationsTable(ctx, db, table); err != nil {
-		return err
-	}
-
-	all, err := ListMigrations(opts.MigrationsDir)
-	if err != nil {
-		return err
-	}
-	applied, err := appliedMigrations(ctx, db, table)
-	if err != nil {
-		return err
-	}
-
-	switch opts.Direction {
-	case "up", "":
-		return applyUp(ctx, db, table, all, applied, opts.Steps)
-	case "down":
-		steps := opts.Steps
-		if steps == 0 {
-			steps = 1
-		}
-		return applyDown(ctx, db, table, all, applied, steps)
-	default:
-		return fmt.Errorf("unknown direction %q", opts.Direction)
-	}
+	return db, nil
 }
 
 func normalizeMigrationsTable(name string) (string, error) {
@@ -85,150 +187,150 @@ func normalizeMigrationsTable(name string) (string, error) {
 	return name, nil
 }
 
-func ensureMigrationsTable(ctx context.Context, db *sql.DB, table string) error {
-	query := fmt.Sprintf(`
-		CREATE TABLE IF NOT EXISTS %s (
-			id         BIGSERIAL PRIMARY KEY,
-			name       TEXT NOT NULL UNIQUE,
-			applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
-		)`, quoteIdent(table))
-	_, err := db.ExecContext(ctx, query)
-	if err != nil {
+func ensureVersionTable(ctx context.Context, db *sql.DB, table string) error {
+	query := fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (version_num VARCHAR(32) NOT NULL)`, quoteIdent(table))
+	if _, err := db.ExecContext(ctx, query); err != nil {
 		return fmt.Errorf("create %s table: %w", table, err)
 	}
 	return nil
 }
 
-func appliedMigrations(ctx context.Context, db *sql.DB, table string) ([]string, error) {
-	query := fmt.Sprintf(`SELECT name FROM %s ORDER BY id`, quoteIdent(table))
-	rows, err := db.QueryContext(ctx, query)
-	if err != nil {
-		return nil, fmt.Errorf("list applied migrations: %w", err)
+func currentRevision(ctx context.Context, db *sql.DB, table string) (string, error) {
+	query := fmt.Sprintf(`SELECT version_num FROM %s LIMIT 1`, quoteIdent(table))
+	var version string
+	switch err := db.QueryRowContext(ctx, query).Scan(&version); err {
+	case nil:
+		return version, nil
+	case sql.ErrNoRows:
+		return "", nil
+	default:
+		return "", fmt.Errorf("read current revision: %w", err)
 	}
-	defer rows.Close()
-
-	var names []string
-	for rows.Next() {
-		var name string
-		if err := rows.Scan(&name); err != nil {
-			return nil, fmt.Errorf("scan applied migration: %w", err)
-		}
-		names = append(names, name)
-	}
-	return names, rows.Err()
 }
 
-func applyUp(ctx context.Context, db *sql.DB, table string, all []Migration, applied []string, steps int) error {
-	appliedSet := make(map[string]struct{}, len(applied))
-	for _, name := range applied {
-		appliedSet[name] = struct{}{}
+// setCurrentRevision replaces the tracked revision. revID "" clears it (base).
+func setCurrentRevision(ctx context.Context, db *sql.DB, table, revID string) error {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin transaction: %w", err)
 	}
+	defer tx.Rollback() //nolint:errcheck
+	if err := writeRevisionPointer(ctx, tx, table, revID); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
 
-	var pending []Migration
-	for _, migration := range all {
-		if _, ok := appliedSet[migration.BaseName()]; !ok {
-			pending = append(pending, migration)
-		}
+func writeRevisionPointer(ctx context.Context, tx *sql.Tx, table, revID string) error {
+	if _, err := tx.ExecContext(ctx, fmt.Sprintf(`DELETE FROM %s`, quoteIdent(table))); err != nil {
+		return fmt.Errorf("clear revision pointer: %w", err)
 	}
-	if len(pending) == 0 {
+	if revID == "" {
 		return nil
 	}
-	if steps > 0 && steps < len(pending) {
-		pending = pending[:steps]
-	}
-
-	for _, migration := range pending {
-		if err := runMigrationUp(ctx, db, table, migration); err != nil {
-			return err
-		}
+	insert := fmt.Sprintf(`INSERT INTO %s (version_num) VALUES ($1)`, quoteIdent(table))
+	if _, err := tx.ExecContext(ctx, insert, revID); err != nil {
+		return fmt.Errorf("record revision %s: %w", revID, err)
 	}
 	return nil
 }
 
-func applyDown(ctx context.Context, db *sql.DB, table string, all []Migration, applied []string, steps int) error {
-	if len(applied) == 0 {
-		return nil
-	}
-
-	byName := make(map[string]Migration, len(all))
-	for _, migration := range all {
-		byName[migration.BaseName()] = migration
-	}
-
-	for range steps {
-		if len(applied) == 0 {
-			return nil
-		}
-		name := applied[len(applied)-1]
-		migration, ok := byName[name]
-		if !ok {
-			return fmt.Errorf("applied migration %q not found on disk", name)
-		}
-		if err := runMigrationDown(ctx, db, table, migration); err != nil {
-			return err
-		}
-		applied = applied[:len(applied)-1]
-	}
-	return nil
-}
-
-func runMigrationUp(ctx context.Context, db *sql.DB, table string, migration Migration) error {
-	sqlBytes, err := os.ReadFile(migration.upPath())
-	if err != nil {
-		return fmt.Errorf("read %s: %w", migration.upPath(), err)
-	}
-
+// runRevision executes migrationSQL and moves the recorded pointer to newRev in
+// a single transaction. Empty SQL (e.g. hand-written stubs) is skipped.
+func runRevision(ctx context.Context, db *sql.DB, table, migrationSQL, newRev string) error {
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin transaction: %w", err)
 	}
 	defer tx.Rollback() //nolint:errcheck
 
-	if _, err := tx.ExecContext(ctx, string(sqlBytes)); err != nil {
-		return fmt.Errorf("apply %s: %w", migration.BaseName(), err)
+	if strings.TrimSpace(migrationSQL) != "" {
+		if _, err := tx.ExecContext(ctx, migrationSQL); err != nil {
+			return err
+		}
 	}
-	insert := fmt.Sprintf(`INSERT INTO %s (name) VALUES ($1)`, quoteIdent(table))
-	if _, err := tx.ExecContext(ctx, insert, migration.BaseName()); err != nil {
-		return fmt.Errorf("record %s: %w", migration.BaseName(), err)
+	if err := writeRevisionPointer(ctx, tx, table, newRev); err != nil {
+		return err
 	}
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("commit %s: %w", migration.BaseName(), err)
-	}
-	return nil
+	return tx.Commit()
 }
 
-func runMigrationDown(ctx context.Context, db *sql.DB, table string, migration Migration) error {
-	sqlBytes, err := os.ReadFile(migration.downPath())
-	if err != nil {
-		return fmt.Errorf("read %s: %w", migration.downPath(), err)
+func resolveUpgradeTarget(ordered []Revision, currentIdx int, target string) (int, error) {
+	target = strings.TrimSpace(target)
+	switch {
+	case target == "" || target == "head":
+		return len(ordered) - 1, nil
+	case strings.HasPrefix(target, "+"):
+		n, err := strconv.Atoi(target[1:])
+		if err != nil || n < 0 {
+			return 0, fmt.Errorf("invalid relative target %q", target)
+		}
+		idx := currentIdx + n
+		if idx >= len(ordered) {
+			return 0, fmt.Errorf("relative target %q goes past head", target)
+		}
+		return idx, nil
+	default:
+		return indexByID(ordered, target)
 	}
-
-	tx, err := db.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("begin transaction: %w", err)
-	}
-	defer tx.Rollback() //nolint:errcheck
-
-	if _, err := tx.ExecContext(ctx, string(sqlBytes)); err != nil {
-		return fmt.Errorf("rollback %s: %w", migration.BaseName(), err)
-	}
-	deleteSQL := fmt.Sprintf(`DELETE FROM %s WHERE name = $1`, quoteIdent(table))
-	result, err := tx.ExecContext(ctx, deleteSQL, migration.BaseName())
-	if err != nil {
-		return fmt.Errorf("unrecord %s: %w", migration.BaseName(), err)
-	}
-	rows, err := result.RowsAffected()
-	if err != nil {
-		return fmt.Errorf("rows affected %s: %w", migration.BaseName(), err)
-	}
-	if rows == 0 {
-		return fmt.Errorf("migration %q was not recorded as applied", migration.BaseName())
-	}
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("commit %s: %w", migration.BaseName(), err)
-	}
-	return nil
 }
 
-// ErrNoMigrations is returned when there is nothing to apply.
-var ErrNoMigrations = errors.New("no migrations to apply")
+func resolveDowngradeTarget(ordered []Revision, currentIdx int, target string) (int, error) {
+	target = strings.TrimSpace(target)
+	switch {
+	case target == "base":
+		return -1, nil
+	case strings.HasPrefix(target, "-"):
+		n, err := strconv.Atoi(target[1:])
+		if err != nil || n < 0 {
+			return 0, fmt.Errorf("invalid relative target %q", target)
+		}
+		idx := currentIdx - n
+		if idx < -1 {
+			return 0, fmt.Errorf("relative target %q goes past base", target)
+		}
+		return idx, nil
+	case target == "" || target == "head":
+		return 0, fmt.Errorf("downgrade requires a target (base, -N, or a revision)")
+	default:
+		return indexByID(ordered, target)
+	}
+}
+
+// indexByID resolves a full revision id or an unambiguous prefix to its index.
+func indexByID(ordered []Revision, id string) (int, error) {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return 0, fmt.Errorf("empty revision id")
+	}
+	exact := -1
+	prefix := -1
+	prefixCount := 0
+	for i, rev := range ordered {
+		if rev.ID == id {
+			exact = i
+		}
+		if strings.HasPrefix(rev.ID, id) {
+			prefix = i
+			prefixCount++
+		}
+	}
+	if exact >= 0 {
+		return exact, nil
+	}
+	switch prefixCount {
+	case 1:
+		return prefix, nil
+	case 0:
+		return 0, fmt.Errorf("revision %q not found", id)
+	default:
+		return 0, fmt.Errorf("revision %q is ambiguous", id)
+	}
+}
+
+func displayDown(revID string) string {
+	if revID == "" {
+		return "<base>"
+	}
+	return revID
+}

@@ -1,63 +1,56 @@
 package go_migrations
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
-	"strconv"
 	"strings"
+	"time"
 )
 
-var migrationFilePattern = regexp.MustCompile(`^(\d+)_.+\.(up|down)\.sql$`)
-
-// NextVersion returns the next sequential migration version based on files in dir.
-func NextVersion(dir string) (int, error) {
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return 1, nil
-		}
-		return 0, fmt.Errorf("read migrations dir %s: %w", dir, err)
+// newRevisionID returns a 12-character hex identifier, matching Alembic's style.
+func newRevisionID() (string, error) {
+	buf := make([]byte, 6)
+	if _, err := rand.Read(buf); err != nil {
+		return "", fmt.Errorf("generate revision id: %w", err)
 	}
-
-	maxVersion := 0
-	for _, entry := range entries {
-		if entry.IsDir() {
-			continue
-		}
-		matches := migrationFilePattern.FindStringSubmatch(entry.Name())
-		if len(matches) < 2 {
-			continue
-		}
-		version, err := strconv.Atoi(matches[1])
-		if err != nil {
-			continue
-		}
-		if version > maxVersion {
-			maxVersion = version
-		}
-	}
-	return maxVersion + 1, nil
+	return hex.EncodeToString(buf), nil
 }
 
-// WriteMigration writes paired up/down SQL files.
-func WriteMigration(dir string, version int, name, upSQL, downSQL string) (string, error) {
+// renderRevisionFile renders a single Alembic-style revision file.
+func renderRevisionFile(rev Revision) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "-- revision: %s\n", rev.ID)
+	fmt.Fprintf(&b, "-- down_revision: %s\n", rev.DownRevision)
+	fmt.Fprintf(&b, "-- create_date: %s\n", rev.CreateDate.Format(time.RFC3339))
+	fmt.Fprintf(&b, "-- message: %s\n", rev.Message)
+
+	b.WriteString("\n" + markerUp + "\n")
+	if sql := strings.TrimSpace(rev.UpSQL); sql != "" {
+		b.WriteString(sql + "\n")
+	}
+	b.WriteString("\n" + markerDown + "\n")
+	if sql := strings.TrimSpace(rev.DownSQL); sql != "" {
+		b.WriteString(sql + "\n")
+	}
+	return b.String()
+}
+
+// WriteRevision writes a single revision file named <id>_<slug>.sql.
+func WriteRevision(dir string, rev Revision) (string, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return "", fmt.Errorf("create migrations dir %s: %w", dir, err)
 	}
 
-	base := fmt.Sprintf("%06d_%s", version, sanitizeName(name))
-	upPath := filepath.Join(dir, base+".up.sql")
-	downPath := filepath.Join(dir, base+".down.sql")
-
-	if err := os.WriteFile(upPath, []byte(upSQL), 0o644); err != nil {
-		return "", fmt.Errorf("write %s: %w", upPath, err)
+	base := rev.ID + "_" + sanitizeName(rev.Message)
+	path := filepath.Join(dir, base+".sql")
+	if err := os.WriteFile(path, []byte(renderRevisionFile(rev)), 0o644); err != nil {
+		return "", fmt.Errorf("write %s: %w", path, err)
 	}
-	if err := os.WriteFile(downPath, []byte(downSQL), 0o644); err != nil {
-		return "", fmt.Errorf("write %s: %w", downPath, err)
-	}
-	return base, nil
+	return path, nil
 }
 
 func sanitizeName(name string) string {
@@ -69,4 +62,3 @@ func sanitizeName(name string) string {
 	}
 	return name
 }
-

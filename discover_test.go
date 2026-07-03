@@ -18,20 +18,50 @@ func fixturesRoot(t *testing.T) string {
 	return filepath.Join("testdata", "fixtures")
 }
 
-func TestListMigrations(t *testing.T) {
+func TestLoadRevisions(t *testing.T) {
 	t.Parallel()
 
 	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "000001_init.up.sql"), []byte("SELECT 1;"), 0o644); err != nil {
+	content := "-- revision: abc123\n-- down_revision:\n-- create_date: 2026-07-03T12:00:00Z\n-- message: init\n\n" +
+		"-- migrate:up\nCREATE TABLE t (id int);\n\n-- migrate:down\nDROP TABLE t;\n"
+	if err := os.WriteFile(filepath.Join(dir, "abc123_init.sql"), []byte(content), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
-	migrations, err := go_migrations.ListMigrations(dir)
+	revisions, err := go_migrations.LoadRevisions(dir)
 	if err != nil {
-		t.Fatalf("ListMigrations() error = %v", err)
+		t.Fatalf("LoadRevisions() error = %v", err)
 	}
-	if len(migrations) != 1 || migrations[0].BaseName() != "000001_init" {
-		t.Fatalf("migrations = %#v", migrations)
+	if len(revisions) != 1 {
+		t.Fatalf("revisions = %#v", revisions)
+	}
+	rev := revisions[0]
+	if rev.ID != "abc123" || rev.DownRevision != "" || rev.Message != "init" {
+		t.Fatalf("rev header = %#v", rev)
+	}
+	if rev.UpSQL != "CREATE TABLE t (id int);" {
+		t.Fatalf("up SQL = %q", rev.UpSQL)
+	}
+	if rev.DownSQL != "DROP TABLE t;" {
+		t.Fatalf("down SQL = %q", rev.DownSQL)
+	}
+}
+
+func TestOrderRevisionsFollowsDownRevision(t *testing.T) {
+	t.Parallel()
+
+	revisions := []go_migrations.Revision{
+		{ID: "c", DownRevision: "b"},
+		{ID: "a", DownRevision: ""},
+		{ID: "b", DownRevision: "a"},
+	}
+	ordered, err := go_migrations.OrderRevisions(revisions)
+	if err != nil {
+		t.Fatalf("OrderRevisions() error = %v", err)
+	}
+	got := []string{ordered[0].ID, ordered[1].ID, ordered[2].ID}
+	if got[0] != "a" || got[1] != "b" || got[2] != "c" {
+		t.Fatalf("order = %v, want [a b c]", got)
 	}
 }
 
@@ -53,8 +83,11 @@ func TestGenerateUsesDiscoveryByDefault(t *testing.T) {
 	if !strings.Contains(result.UpSQL, `CREATE TABLE "plans"`) {
 		t.Fatalf("up SQL missing plans table:\n%s", result.UpSQL)
 	}
-	if result.BaseName != "000001_initial" {
-		t.Fatalf("BaseName = %q, want 000001_initial", result.BaseName)
+	if result.Message != "initial" {
+		t.Fatalf("Message = %q, want initial", result.Message)
+	}
+	if result.Revision == "" || result.DownRevision != "" {
+		t.Fatalf("first revision = %q, down_revision = %q", result.Revision, result.DownRevision)
 	}
 }
 

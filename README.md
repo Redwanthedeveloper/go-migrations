@@ -1,116 +1,148 @@
 # go_migrations
 
-Django-style database migrations for Go projects using [GORM](https://gorm.io) models and PostgreSQL.
+Alembic-style database migrations for Go projects using [GORM](https://gorm.io) models and PostgreSQL.
 
-`go_migrations` compares your GORM struct definitions to the current database schema, generates versioned `.up.sql` / `.down.sql` files, and applies them with a simple migration runner.
+`go_migrations` compares your GORM struct definitions to the current database schema, generates versioned revision files linked by `down_revision` (exactly like [Alembic](https://alembic.sqlalchemy.org)), and applies them with `upgrade` / `downgrade`.
 
 ## Features
 
 - Auto-discover GORM models from `internal/*/model/` packages
-- Django-style auto-generated migration names (`000001_initial`, `000002_tenant_email`, …)
-- SQL up/down migration files on disk
-- Applied migrations tracked in a PostgreSQL table (default: `go_migrations`)
-- Fresh-app support: first migration works with an empty `migrations/` folder (no DB required)
-- Live database introspection when migration files already exist
+- Alembic-style revisions: each file has a hash `revision` id and a `down_revision` pointer forming a history chain
+- Single `.sql` file per revision with `-- migrate:up` / `-- migrate:down` sections
+- Current revision tracked in a one-row PostgreSQL table (`version_num`), like Alembic's `alembic_version`
+- Relative targets: `upgrade +2`, `downgrade -1`, plus `head` / `base` / revision ids (or prefixes)
+- Fresh-app support: the first `revision --autogenerate` works with an empty `migrations/` folder (no DB required)
+- Live database introspection when revisions already exist
 
 ## Install
 
 ```bash
-go get github.com/Redwanthedeveloper/go-migrations@v0.1.0
+go install github.com/Redwanthedeveloper/go-migrations/cmd/go_migrations@latest
 ```
 
-Or use the CLI tools:
+Or use it as a library:
 
 ```bash
-go install github.com/Redwanthedeveloper/go-migrations/cmd/makemigrations@latest
-go install github.com/Redwanthedeveloper/go-migrations/cmd/migrate@latest
+go get github.com/Redwanthedeveloper/go-migrations@latest
 ```
 
 ## Quick start
 
 1. Define GORM models under `internal/{domain}/model/`.
-2. Generate migrations:
+2. Generate a revision from your models:
 
 ```bash
-makemigrations -models . -dir migrations
+go_migrations revision --autogenerate -m "create users"
 ```
 
-3. Apply migrations:
+3. Apply it:
 
 ```bash
 export DATABASE_URL=postgres://user:pass@localhost:5432/mydb?sslmode=disable
-migrate -dir migrations -database-url "$DATABASE_URL"
+go_migrations upgrade head
 ```
 
 ## CLI reference
 
-### makemigrations
+Commands mirror Alembic; only the program name differs.
+
+| Alembic | go_migrations | Description |
+| ------- | ------------- | ----------- |
+| `alembic revision --autogenerate -m "msg"` | `go_migrations revision --autogenerate -m "msg"` | Diff GORM models → revision file |
+| `alembic revision -m "msg"` | `go_migrations revision -m "msg"` | Empty, hand-edited revision |
+| `alembic upgrade head` | `go_migrations upgrade head` | Apply all pending revisions |
+| `alembic upgrade +2` | `go_migrations upgrade +2` | Apply the next N revisions |
+| `alembic upgrade <rev>` | `go_migrations upgrade <rev>` | Upgrade up to a revision |
+| `alembic downgrade base` | `go_migrations downgrade base` | Roll back every revision |
+| `alembic downgrade -1` | `go_migrations downgrade -1` | Roll back N revisions |
+| `alembic downgrade <rev>` | `go_migrations downgrade <rev>` | Downgrade back to a revision |
+| `alembic current` | `go_migrations current` | Show the current revision |
+| `alembic history` | `go_migrations history` | List revisions (head → base) |
+| `alembic heads` | `go_migrations heads` | Show head revision(s) |
+| `alembic stamp head` | `go_migrations stamp head` | Set the recorded revision without running SQL |
+
+### Global flags
+
+Available on every command:
 
 | Flag | Default | Description |
 | ---- | ------- | ----------- |
-| `-models` | `.` | Module root for model discovery |
-| `-dir` | `migrations` | Output directory |
-| `-database-url` | `$DATABASE_URL` | PostgreSQL URL (required when migrations exist) |
-| `-migrations-table` | `go_migrations` | Table used to track applied migrations |
-| `-dry-run` | `false` | Print SQL without writing files |
+| `-dir` | `migrations` | Revisions directory |
+| `-database-url` | `$DATABASE_URL` | PostgreSQL URL (required for DB commands) |
+| `-migrations-table` | `go_migrations_version` | One-row revision tracking table |
 
-### migrate
+`revision` adds: `-m` (message), `--autogenerate` (diff models), `-models` (module root, default `.`), `-dry-run`.
 
-| Flag | Default | Description |
-| ---- | ------- | ----------- |
-| `-direction` | `up` | `up` or `down` |
-| `-steps` | `0` | Steps to run (0 = all pending for up, 1 for down) |
-| `-dir` | `migrations` | Migrations directory |
-| `-database-url` | `$DATABASE_URL` | PostgreSQL URL (required) |
-| `-migrations-table` | `go_migrations` | Applied migrations table |
+## Revision file format
+
+Each revision is a single SQL file named `<revision>_<slug>.sql`:
+
+```sql
+-- revision: 9106914b8a65
+-- down_revision: 
+-- create_date: 2026-07-03T12:00:00Z
+-- message: create users
+
+-- migrate:up
+CREATE TABLE users (...);
+
+-- migrate:down
+DROP TABLE users;
+```
+
+Ordering comes from the `down_revision` chain, not the filename — exactly like Alembic. The base revision has an empty `down_revision`.
 
 ## Library usage
 
 ```go
-import "github.com/Redwanthedeveloper/go-migrations"
+import go_migrations "github.com/Redwanthedeveloper/go-migrations"
 
+// Generate a revision from GORM models (autogenerate).
 result, err := go_migrations.Generate(ctx, go_migrations.Options{
     ModelsRoot:    ".",
     MigrationsDir: "migrations",
     DatabaseURL:   os.Getenv("DATABASE_URL"),
+    Message:       "create users",
 })
 
-err = go_migrations.Apply(ctx, go_migrations.MigrateOptions{
+// Apply / roll back.
+opts := go_migrations.MigrateOptions{
     DatabaseURL:   os.Getenv("DATABASE_URL"),
     MigrationsDir: "migrations",
-    Direction:     "up",
-})
+}
+err = go_migrations.Upgrade(ctx, opts, "head")
+err = go_migrations.Downgrade(ctx, opts, "-1")
+err = go_migrations.Stamp(ctx, opts, "head")
+current, err := go_migrations.CurrentRevision(ctx, opts)
 ```
 
 ## Auto-naming
 
-| Change | Example |
-| ------ | ------- |
-| First migration | `000001_initial` |
-| New model | `000002_contact` |
-| Add column | `000003_tenant_email` |
-| Multiple changes | `000004_plan_code_and_more` |
+When `-m` is omitted, `--autogenerate` derives a slug from the detected changes:
 
-## Publishing
-
-Published at [github.com/Redwanthedeveloper/go-migrations](https://github.com/Redwanthedeveloper/go-migrations).
-
-**Module path:** `github.com/Redwanthedeveloper/go-migrations`
-
-To release a new version:
-
-```bash
-git tag v0.1.1
-git push origin v0.1.1
-```
-
-Go module proxy will index the tag automatically.
+| Change | Example message |
+| ------ | --------------- |
+| First revision | `initial` |
+| New model | `contact` |
+| Add column | `tenant_email` |
+| Multiple changes | `plan_code_and_more` |
 
 ## Requirements
 
 - Go 1.22+
 - PostgreSQL
 - GORM-tagged structs
+
+## Publishing
+
+Published at [github.com/Redwanthedeveloper/go-migrations](https://github.com/Redwanthedeveloper/go-migrations).
+
+To release a new version:
+
+```bash
+git tag v0.2.0
+git push origin v0.2.0
+```
 
 ## License
 

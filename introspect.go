@@ -314,6 +314,8 @@ func normalizeDefault(value string) string {
 func introspectExcludedTables(extra ...string) []string {
 	seen := map[string]struct{}{
 		DefaultMigrationsTable: {},
+		"go_migrations":        {},
+		"alembic_version":      {},
 		"schema_migrations":    {},
 		"django_migrations":    {},
 	}

@@ -1,7 +1,6 @@
 package go_migrations
 
 import (
-	"fmt"
 	"sort"
 	"strings"
 )
@@ -126,9 +125,4 @@ func singularize(word string) string {
 		return word[:len(word)-1]
 	}
 	return word
-}
-
-// FormatMigrationBase returns the full migration base name, e.g. 000001_initial.
-func FormatMigrationBase(version int, slug string) string {
-	return fmt.Sprintf("%06d_%s", version, sanitizeName(slug))
 }
