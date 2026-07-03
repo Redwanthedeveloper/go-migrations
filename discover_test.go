@@ -123,6 +123,7 @@ func TestDiscoverSchemaMatchesSchemaFromModels(t *testing.T) {
 		&fixturePlan{},
 		&fixtureTenant{},
 		&fixtureTenantModule{},
+		&fixtureOAuthAccount{},
 	})
 	if err != nil {
 		t.Fatalf("SchemaFromModels() error = %v", err)
@@ -219,3 +220,49 @@ type fixtureTenantModule struct {
 }
 
 func (fixtureTenantModule) TableName() string { return "tenant_modules" }
+
+type fixtureOAuthAccount struct {
+	ID             uuid.UUID `gorm:"type:uuid;primaryKey;default:gen_random_uuid()"`
+	UserID         uuid.UUID `gorm:"type:uuid;not null;index:idx_oauth_accounts_user_id"`
+	Provider       string    `gorm:"type:text;not null;uniqueIndex:idx_oauth_accounts_provider_user"`
+	ProviderUserID string    `gorm:"type:text;not null;uniqueIndex:idx_oauth_accounts_provider_user"`
+	CreatedAt      time.Time `gorm:"type:timestamptz;not null;default:now()"`
+}
+
+func (fixtureOAuthAccount) TableName() string { return "oauth_accounts" }
+
+func TestDiscoverSchemaCompositeUniqueIndex(t *testing.T) {
+	t.Parallel()
+
+	schema, err := go_migrations.DiscoverSchema(fixturesRoot(t))
+	if err != nil {
+		t.Fatalf("DiscoverSchema() error = %v", err)
+	}
+
+	for _, table := range schema.Tables {
+		if table.Name != "oauth_accounts" {
+			continue
+		}
+		for _, idx := range table.Indexes {
+			if idx.Name != "idx_oauth_accounts_provider_user" {
+				continue
+			}
+			if !idx.Unique {
+				t.Fatalf("index %q should be unique", idx.Name)
+			}
+			// Both columns must live under one index, ordered by struct position.
+			want := []string{"provider", "provider_user_id"}
+			if len(idx.Columns) != len(want) {
+				t.Fatalf("index columns = %v, want %v", idx.Columns, want)
+			}
+			for i, col := range want {
+				if idx.Columns[i] != col {
+					t.Fatalf("index columns = %v, want %v", idx.Columns, want)
+				}
+			}
+			return
+		}
+		t.Fatalf("oauth_accounts indexes = %#v, want composite idx_oauth_accounts_provider_user", table.Indexes)
+	}
+	t.Fatal("oauth_accounts table not found")
+}

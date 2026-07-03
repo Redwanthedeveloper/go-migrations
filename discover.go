@@ -7,6 +7,8 @@ import (
 	"go/token"
 	"os"
 	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
 
 	"gorm.io/gorm/schema"
@@ -360,6 +362,8 @@ func tableFromModel(model modelType) (Table, error) {
 	}
 
 	table := Table{Name: tableName}
+	indexes := newIndexCollector()
+	seq := 0
 	for _, field := range model.fields {
 		settings := field.settings
 		if len(settings) == 0 {
@@ -381,15 +385,69 @@ func tableFromModel(model modelType) (Table, error) {
 		}
 		table.Columns = append(table.Columns, col)
 
-		if idxName := indexNameFromSettings(settings); idxName != "" {
-			table.Indexes = append(table.Indexes, Index{
-				Name:    idxName,
-				Columns: []string{col.Name},
-				Unique:  settings["UNIQUEINDEX"] != "",
-			})
+		// Fields sharing an index name form a single (possibly composite) index.
+		if name, unique, priority, ok := indexFromSettings(settings); ok {
+			indexes.add(name, col.Name, unique, priority, seq)
 		}
+		seq++
 	}
+	table.Indexes = indexes.build()
 	return table, nil
+}
+
+// indexColumn tracks a column's placement within a named index. GORM orders
+// composite index columns by priority, then by struct field order.
+type indexColumn struct {
+	name     string
+	priority int
+	seq      int
+}
+
+type indexEntry struct {
+	unique  bool
+	columns []indexColumn
+}
+
+type indexCollector struct {
+	order   []string
+	entries map[string]*indexEntry
+}
+
+func newIndexCollector() *indexCollector {
+	return &indexCollector{entries: make(map[string]*indexEntry)}
+}
+
+func (c *indexCollector) add(name, column string, unique bool, priority, seq int) {
+	entry, ok := c.entries[name]
+	if !ok {
+		entry = &indexEntry{}
+		c.entries[name] = entry
+		c.order = append(c.order, name)
+	}
+	entry.unique = entry.unique || unique
+	entry.columns = append(entry.columns, indexColumn{name: column, priority: priority, seq: seq})
+}
+
+func (c *indexCollector) build() []Index {
+	if len(c.order) == 0 {
+		return nil
+	}
+	out := make([]Index, 0, len(c.order))
+	for _, name := range c.order {
+		entry := c.entries[name]
+		sort.SliceStable(entry.columns, func(i, j int) bool {
+			if entry.columns[i].priority != entry.columns[j].priority {
+				return entry.columns[i].priority < entry.columns[j].priority
+			}
+			return entry.columns[i].seq < entry.columns[j].seq
+		})
+		cols := make([]string, len(entry.columns))
+		for i, col := range entry.columns {
+			cols[i] = col.name
+		}
+		out = append(out, Index{Name: name, Columns: cols, Unique: entry.unique})
+	}
+	return out
 }
 
 func columnFromModelField(field modelField) Column {
@@ -508,14 +566,33 @@ func reflectStructTag(structTag, key string) string {
 	}
 }
 
-func indexNameFromSettings(settings map[string]string) string {
-	if name := settings["UNIQUEINDEX"]; name != "" {
-		return name
+// indexFromSettings extracts the index name, uniqueness, and column priority
+// from a field's GORM settings. It understands the `index:name,priority:N` and
+// `uniqueIndex:name,priority:N` forms so composite indexes order columns
+// correctly. Bare `index`/`uniqueIndex` (no name) are skipped.
+func indexFromSettings(settings map[string]string) (name string, unique bool, priority int, ok bool) {
+	raw, unique := settings["UNIQUEINDEX"], true
+	if raw == "" {
+		raw, unique = settings["INDEX"], false
+		if raw == "" {
+			return "", false, 0, false
+		}
 	}
-	if name := settings["INDEX"]; name != "" {
-		return name
+
+	parts := strings.Split(raw, ",")
+	name = strings.TrimSpace(parts[0])
+	if name == "" {
+		return "", false, 0, false
 	}
-	return ""
+	for _, opt := range parts[1:] {
+		opt = strings.TrimSpace(opt)
+		if key, value, found := strings.Cut(opt, ":"); found && strings.EqualFold(key, "priority") {
+			if p, err := strconv.Atoi(strings.TrimSpace(value)); err == nil {
+				priority = p
+			}
+		}
+	}
+	return name, unique, priority, true
 }
 
 func settingEnabled(settings map[string]string, keys ...string) bool {
