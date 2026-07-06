@@ -75,7 +75,7 @@ Available on every command:
 
 ## Revision file format
 
-Each revision is a single SQL file named `<revision>_<slug>.sql`:
+Each revision is a single SQL file named `<seq>_<revision>_<slug>.sql` (for example `000001_9106914b8a65_create_users.sql`). The six-digit sequence prefix keeps files in apply order when listed by name; the revision id in the header is still the canonical identifier.
 
 ```sql
 -- revision: 9106914b8a65

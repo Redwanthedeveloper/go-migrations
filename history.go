@@ -26,7 +26,7 @@ const (
 	markerDown = "-- migrate:down"
 )
 
-// LoadRevisions parses every revision file in dir. The result is unordered.
+// LoadRevisions parses every revision file in dir, ordered base to head.
 func LoadRevisions(dir string) ([]Revision, error) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -48,7 +48,7 @@ func LoadRevisions(dir string) ([]Revision, error) {
 		}
 		revisions = append(revisions, rev)
 	}
-	return revisions, nil
+	return OrderRevisions(revisions)
 }
 
 // ParseRevisionFile reads and parses a single revision file.
@@ -160,13 +160,9 @@ func OrderRevisions(revisions []Revision) ([]Revision, error) {
 	return ordered, nil
 }
 
-// OrderedRevisions loads and orders revisions from dir (base to head).
+// OrderedRevisions loads revisions from dir (base to head).
 func OrderedRevisions(dir string) ([]Revision, error) {
-	revisions, err := LoadRevisions(dir)
-	if err != nil {
-		return nil, err
-	}
-	return OrderRevisions(revisions)
+	return LoadRevisions(dir)
 }
 
 // Heads returns every revision that has no descendant.
@@ -206,6 +202,9 @@ func HeadRevision(dir string) (string, error) {
 		return "", nil
 	}
 	heads := headIDs(revisions)
+	if len(heads) == 0 {
+		return "", fmt.Errorf("no head revision found (cyclic history?)")
+	}
 	if len(heads) > 1 {
 		return "", fmt.Errorf("multiple heads: %s", strings.Join(heads, ", "))
 	}

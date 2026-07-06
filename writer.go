@@ -39,18 +39,31 @@ func renderRevisionFile(rev Revision) string {
 	return b.String()
 }
 
-// WriteRevision writes a single revision file named <id>_<slug>.sql.
+// WriteRevision writes a single revision file named <seq>_<id>_<slug>.sql.
+// The sequence prefix keeps migrations in apply order when listed by filename.
 func WriteRevision(dir string, rev Revision) (string, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return "", fmt.Errorf("create migrations dir %s: %w", dir, err)
 	}
 
-	base := rev.ID + "_" + sanitizeName(rev.Message)
+	base, err := revisionFileBase(dir, rev)
+	if err != nil {
+		return "", err
+	}
 	path := filepath.Join(dir, base+".sql")
 	if err := os.WriteFile(path, []byte(renderRevisionFile(rev)), 0o644); err != nil {
 		return "", fmt.Errorf("write %s: %w", path, err)
 	}
 	return path, nil
+}
+
+func revisionFileBase(dir string, rev Revision) (string, error) {
+	ordered, err := OrderedRevisions(dir)
+	if err != nil {
+		return "", err
+	}
+	seq := len(ordered) + 1
+	return fmt.Sprintf("%06d_%s_%s", seq, rev.ID, sanitizeName(rev.Message)), nil
 }
 
 func sanitizeName(name string) string {
